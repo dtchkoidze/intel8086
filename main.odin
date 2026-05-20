@@ -73,57 +73,156 @@ Op_Kind :: enum u8 {
 	Add_Imm_To_Acc,
 }
 
+Fmt :: enum u8 {
+	None,
+	ModRM,
+	Imm8,
+	Imm16,
+	RegImm,
+	RegOnly,
+	Rel8,
+	Rel16,
+	AccMem,
+	ImmGroup,
+}
+
 Op_Info :: struct {
-	kind:      Op_Kind,
-	has_modrm: bool,
+	kind: Op_Kind,
+	fmt:  Fmt,
 }
 
 op_info :: proc(opcode: u8) -> (Op_Info, bool) {
-	if opcode >> 2 == 0b100010 {
-		return Op_Info{.Mov_RM_To_From_Reg, true}, true
-	}
+	if opcode >> 2 == 0b100010 {return Op_Info{.Mov_RM_To_From_Reg, .ModRM}, true}
+	if opcode >> 1 == 0b1100011 {return Op_Info{.Mov_Imm_To_RM, .ModRM}, true}
+	if opcode >> 4 == 0b1011 {return Op_Info{.Mov_Imm_To_Reg, .RegImm}, true}
+	if opcode >> 1 == 0b1010000 {return Op_Info{.Mov_Mem_To_Acc, .AccMem}, true}
+	if opcode >> 1 == 0b1010001 {return Op_Info{.Mov_Acc_To_Mem, .AccMem}, true}
+	if opcode == 0b10001110 {return Op_Info{.Mov_RM_To_Seg, .ModRM}, true}
+	if opcode == 0b10001100 {return Op_Info{.Mov_Seg_To_RM, .ModRM}, true}
 
-	if opcode >> 1 == 0b1100011 {
-		return Op_Info{.Mov_Imm_To_RM, true}, true
-	}
+	if opcode >> 2 == 0b000000 {return Op_Info{.Add_RM_To_RM, .ModRM}, true}
+	if opcode >> 2 == 0b100000 {return Op_Info{.Add_Imm_To_RM, .ModRM}, true}
+	if opcode >> 1 == 0b0000010 {return Op_Info{.Add_Imm_To_Acc, .Imm16}, true}
 
-	if opcode >> 4 == 0b1011 {
-		return Op_Info{.Mov_Imm_To_Reg, false}, true
-	}
 
-	if opcode >> 1 == 0b1010000 {
-		return Op_Info{.Mov_Mem_To_Acc, false}, true
-	}
-
-	if opcode >> 1 == 0b1010001 {
-		return Op_Info{.Mov_Acc_To_Mem, false}, true
-	}
-
-	if opcode == 0b10001110 {
-		return Op_Info{.Mov_RM_To_Seg, true}, true
-	}
-
-	if opcode == 0b10001100 {
-		return Op_Info{.Mov_Seg_To_RM, true}, true
-	}
-
-	if opcode >> 2 == 0b000000 {
-		return Op_Info{.Add_RM_To_RM, true}, true
-	}
 
 	return {}, false
 }
 
 mnemonic_from_kind :: proc(k: Op_Kind) -> string {
 	kint := int(k)
-	if kint >= 0 && kint <= 7 {
+	if kint >= 0 && kint < 7 {
 		return "mov"
 	}
 
-	if kint > 7 && kint < 10 {
+	if kint >= 7 && kint < 10 {
 		return "add"
 	}
 
+	return "dunno"
+}
+
+read_displacement :: proc(bdata: []byte, i: ^int, modrm: ModRM) -> i16 {
+
+	mod := Mod(modrm.mod)
+
+	switch mod {
+	case .MemMode:
+		// Except when R/M = 110, then 16-bit displacement follows
+		if modrm.rm == 0b110 {
+			disp := (^i16)(&bdata[i^])^
+			i^ += 2
+			return disp
+		}
+
+		return 0
+
+	case .MemMode8Bit:
+		disp := i16(i8(bdata[i^]))
+		i^ += 1
+		return disp
+
+	case .MemMode16Bit:
+		disp := (^i16)(&bdata[i^])^
+		i^ += 2
+		return disp
+
+	case .RegMode:
+		return 0
+	}
+
+	return 0
+}
+
+read_imm :: proc(bdata: []byte, i: ^int, w: u8) -> i16 {
+	if w == 1 {
+		v := (^i16)(&bdata[i^])^; i^ += 2; return v
+	}
+	v := i16(i8(bdata[i^])); i^ += 1; return v
+}
+
+decode_ops :: proc(bdata: []byte, i: ^int, opcode: u8, info: Op_Info) -> string {
+	switch info.fmt {
+	case .None:
+		return ""
+	case .RegOnly:
+		reg := opcode & 0b111
+		return decode_reg(reg, 1) // always 16-bit
+	case .RegImm:
+		w := (opcode >> 3) & 1
+		reg := opcode & 0b111
+		imm := read_imm(bdata, i, w)
+		return fmt.aprintf("%s, %d", decode_reg(reg, w), imm)
+	case .Rel8:
+		rel := i16(i8(bdata[i^])); i^ += 1
+		return fmt.aprintf("%+d", rel) // or compute abs addr if you track IP
+	case .Rel16:
+		rel := (^i16)(&bdata[i^])^; i^ += 2
+		return fmt.aprintf("%+d", rel)
+	case .AccMem:
+		w := opcode_w(opcode)
+		addr := (^u16)(&bdata[i^])^; i^ += 2
+		acc := "ax" if w == 1 else "al"
+		if info.kind == .Mov_Mem_To_Acc {
+			return fmt.aprintf("%s, [%d]", acc, addr)
+		}
+		return fmt.aprintf("[%d], %s", addr, acc)
+	case .ModRM:
+		modrm := transmute(ModRM)bdata[i^]
+		i^ += 1 // acc for modrm
+		displacement := read_displacement(bdata, i, modrm)
+		w := opcode_w(opcode)
+		rmop := decode_rm(modrm.rm, Mod(modrm.mod), displacement, w)
+
+		if info.kind == .Mov_Imm_To_RM {
+			imm := read_imm(bdata, i, w)
+			size := "byte" if w == 0 else "word"
+			if Mod(modrm.mod) != .RegMode {
+				return fmt.aprintf("%s %s, %d", size, rmop, imm)
+			}
+			return fmt.aprintf("%s, %d", rmop, imm)
+		}
+
+
+		regop := decode_reg(modrm.reg, w)
+
+		dst := regop
+		src := rmop
+
+		if opcode_d(opcode) == 0 {
+			dst = rmop
+			src = regop
+		}
+
+		ops := strings.join([]string{dst, src}, ", ", context.allocator)
+		return ops
+	case .ImmGroup:
+	case .Imm16:
+
+	case .Imm8:
+		imm := bdata[i^]; i^ += 1
+		return fmt.aprintf("%d", imm)
+	}
 	return "dunno"
 }
 
@@ -152,41 +251,20 @@ main :: proc() {
 	i := 0
 	for i < len(bdata) {
 		opcode := bdata[i] //ok first bbyte, can have extra w,d,s,op6 in it
+		log.infof("opcode: %08b", opcode)
+		i += 1
 		op_info, ok := op_info(opcode)
+		log.infof("opinfo: %v", op_info)
+
 		if !ok {
 			log.errorf("unknown operation: %08b", opcode)
 			return
 		}
 		mnemonic := mnemonic_from_kind(op_info.kind)
-		log.infof("doing %s: %v", mnemonic, op_info)
-		i += 1 //account just for opcode
-
-		rmop: string //reg/mod operand
-		regop: string //reg operand
-		displacement: i16
-
-		if op_info.has_modrm {
-			modrm := transmute(ModRM)bdata[i]
-			i += 1 // acc for modrm
-			log.infof("modrm: %v", modrm)
-			rmop := decode_rm(modrm.rm, Mod(modrm.mod), displacement, opcode_w(opcode))
-			regop := decode_reg(modrm.reg, opcode_w(opcode))
-
-			dst := regop
-			src := rmop
-
-			if opcode_d(opcode) == 0 {
-				dst = rmop
-				src = regop
-			}
-
-			ops := strings.join([]string{rmop, regop}, ", ", context.allocator)
-			line := strings.join([]string{mnemonic, ops}, " ", context.allocator)
-			log.info(line)
-			asmStr = strings.join([]string{asmStr, line}, "\n", context.allocator)
-		} else {
-
-		}
+		ops := decode_ops(bdata, &i, opcode, op_info)
+		line := ops == "" ? mnemonic : fmt.aprintf("%s %s", mnemonic, ops)
+		log.infof("LINE: %s", line)
+		asmStr = strings.join({asmStr, line}, "\n", context.allocator)
 	}
 	// results
 	log.info("_____________________")
@@ -202,7 +280,7 @@ main :: proc() {
 	defer os.remove(tmpAsmFname)
 
 	rdata, cok := compile(tmpAsmFname)
-	if !ok {
+	if !cok {
 		log.errorf("failed to compile tmp asm")
 		return
 	}
