@@ -4,32 +4,7 @@ import "core:bytes"
 import "core:fmt"
 import "core:log"
 import "core:os"
-import "core:path/filepath"
 import "core:strings"
-
-find_executable :: proc(name: string) -> (string, bool) {
-	path_env, ok := os.lookup_env_alloc("PATH", context.allocator)
-	if !ok do return "", false
-
-	dirs := strings.split(path_env, ":")
-	defer delete(dirs)
-
-	for dir in dirs {
-		full, err := filepath.join({dir, name}, context.allocator)
-		if err != nil do return "", false
-		if os.exists(full) {
-			stat, err := os.stat(full, context.allocator)
-			defer os.file_info_delete(stat, context.allocator)
-			if err != nil do return "", false
-			is_exec := os.Permissions_Execute_All & stat.mode != {}
-			if is_exec {
-				return full, true
-			}
-		}
-		delete(full)
-	}
-	return "", false
-}
 
 ModRM :: bit_field u8 {
 	rm:  u8 | 3,
@@ -37,22 +12,32 @@ ModRM :: bit_field u8 {
 	mod: u8 | 2,
 }
 
-Instruction :: bit_field u8 {
-	w:  u8 | 1,
-	d:  u8 | 1,
-	op: u8 | 6,
+opcode_w :: proc(opcode: byte) -> u8 {
+	return opcode & 1
 }
 
-reg_name :: proc(reg: u8, w: u8) -> string {
+opcode_d :: proc(opcode: byte) -> u8 {
+	return (opcode >> 1) & 1
+}
+
+opcode_s :: proc(opcode: byte) -> u8 {
+	return (opcode >> 1) & 1
+}
+
+opcode_op6 :: proc(opcode: byte) -> u8 {
+	return opcode >> 2
+}
+
+decode_reg :: proc(reg: u8, w: u8) -> string {
 	w1 := [8]string{"ax", "cx", "dx", "bx", "sp", "bp", "si", "di"}
 	w0 := [8]string{"al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"}
 	return w1[reg] if w == 1 else w0[reg]
 }
 
-rm_name :: proc(rm: u8, mod: Mod, displcmnt: i16, w: u8) -> string {
+decode_rm :: proc(rm: u8, mod: Mod, displcmnt: i16, w: u8) -> string {
 	switch mod {
 	case .RegMode:
-		return reg_name(rm, w)
+		return decode_reg(rm, w)
 	case .MemMode, .MemMode8Bit, .MemMode16Bit:
 		base := [8]string{"bx+si", "bx+di", "bp+si", "bp+di", "si", "di", "bp", "bx"}
 		if mod == .MemMode && rm == 0b110 {
@@ -66,52 +51,80 @@ rm_name :: proc(rm: u8, mod: Mod, displcmnt: i16, w: u8) -> string {
 	return "EHM DUNNO"
 }
 
-compile :: proc(filename: string) -> ([]byte, bool) {
-	data, err := os.read_entire_file(filename, context.allocator)
-	if err != nil {
-		log.errorf("failed to read file %v", err)
-		return []byte{}, false
-	}
-	defer delete(data)
-
-	nasmexe, oknasm := find_executable("nasm")
-	if !oknasm {
-		log.errorf("failed to find nasm executable on machine")
-		return []byte{}, false
-	}
-
-	binf := strings.join([]string{"/tmp/", filename, ".bin"}, "", context.allocator)
-
-	command := []string{nasmexe, "-f", "bin", filename, "-o", binf}
-	process, perr := os.process_start({command = command, stdout = os.stdout, stderr = os.stderr})
-	if perr != nil {
-		log.error(perr)
-		return []byte{}, false
-	}
-	s, werr := os.process_wait(process)
-	if werr != nil {
-		kerr := os.process_kill(process)
-		if kerr != nil {
-			return []byte{}, false
-		}
-		return []byte{}, false
-	}
-
-	bdata, berr := os.read_entire_file(binf, context.allocator)
-	if berr != nil {
-		log.errorf("failed to read binary file: %v", err)
-		return []byte{}, false
-	}
-
-	return bdata, true
-}
-
-
+// first two bits of MODRM
+// MOD | REG | RM
 Mod :: enum u8 {
 	MemMode      = 0b00, //Memory Mode, no displacement follows*
 	MemMode8Bit  = 0b01, //Memory Mode, 8-bit displacement follows
 	MemMode16Bit = 0b10, //Memory Mode, 16-bit displacement followS
 	RegMode      = 0b11, //Register Mode (nodisplacement)
+}
+
+Op_Kind :: enum u8 {
+	Mov_RM_To_From_Reg,
+	Mov_Imm_To_RM,
+	Mov_Imm_To_Reg,
+	Mov_Mem_To_Acc,
+	Mov_Acc_To_Mem,
+	Mov_RM_To_Seg,
+	Mov_Seg_To_RM,
+	Add_RM_To_RM,
+	Add_Imm_To_RM,
+	Add_Imm_To_Acc,
+}
+
+Op_Info :: struct {
+	kind:      Op_Kind,
+	has_modrm: bool,
+}
+
+op_info :: proc(opcode: u8) -> (Op_Info, bool) {
+	if opcode >> 2 == 0b100010 {
+		return Op_Info{.Mov_RM_To_From_Reg, true}, true
+	}
+
+	if opcode >> 1 == 0b1100011 {
+		return Op_Info{.Mov_Imm_To_RM, true}, true
+	}
+
+	if opcode >> 4 == 0b1011 {
+		return Op_Info{.Mov_Imm_To_Reg, false}, true
+	}
+
+	if opcode >> 1 == 0b1010000 {
+		return Op_Info{.Mov_Mem_To_Acc, false}, true
+	}
+
+	if opcode >> 1 == 0b1010001 {
+		return Op_Info{.Mov_Acc_To_Mem, false}, true
+	}
+
+	if opcode == 0b10001110 {
+		return Op_Info{.Mov_RM_To_Seg, true}, true
+	}
+
+	if opcode == 0b10001100 {
+		return Op_Info{.Mov_Seg_To_RM, true}, true
+	}
+
+	if opcode >> 2 == 0b000000 {
+		return Op_Info{.Add_RM_To_RM, true}, true
+	}
+
+	return {}, false
+}
+
+mnemonic_from_kind :: proc(k: Op_Kind) -> string {
+	kint := int(k)
+	if kint >= 0 && kint <= 7 {
+		return "mov"
+	}
+
+	if kint > 7 && kint < 10 {
+		return "add"
+	}
+
+	return "dunno"
 }
 
 main :: proc() {
@@ -138,54 +151,41 @@ main :: proc() {
 	asmStr: string = "bits 16"
 	i := 0
 	for i < len(bdata) {
-		instr := transmute(Instruction)bdata[i]
-		if instr.op == 0b100010 { 	//here we do have modrm
-			// reg/mem mov
-			modrm := transmute(ModRM)bdata[i + 1]
-			i += 2
-			MOD := Mod(modrm.mod)
-			displacement: i16 = 0
+		opcode := bdata[i] //ok first bbyte, can have extra w,d,s,op6 in it
+		op_info, ok := op_info(opcode)
+		if !ok {
+			log.errorf("unknown operation: %08b", opcode)
+			return
+		}
+		mnemonic := mnemonic_from_kind(op_info.kind)
+		log.infof("doing %s: %v", mnemonic, op_info)
+		i += 1 //account just for opcode
 
-			switch MOD {
-			case .MemMode:
-				if modrm.rm == 0b110 {
-					displacement = (^i16)(&bdata[i])^
-					i += 2
-				}
-			case .RegMode:
-			case .MemMode8Bit:
-				displacement = i16(i8(bdata[i]))
-				i += 1
-			case .MemMode16Bit:
-				displacement = (^i16)(&bdata[i])^
-				i += 2
+		rmop: string //reg/mod operand
+		regop: string //reg operand
+		displacement: i16
+
+		if op_info.has_modrm {
+			modrm := transmute(ModRM)bdata[i]
+			i += 1 // acc for modrm
+			log.infof("modrm: %v", modrm)
+			rmop := decode_rm(modrm.rm, Mod(modrm.mod), displacement, opcode_w(opcode))
+			regop := decode_reg(modrm.reg, opcode_w(opcode))
+
+			dst := regop
+			src := rmop
+
+			if opcode_d(opcode) == 0 {
+				dst = rmop
+				src = regop
 			}
 
-			op1 := reg_name(modrm.reg, instr.w)
-			op2 := rm_name(modrm.rm, MOD, displacement, instr.w)
-			if instr.d == 0 do op1, op2 = op2, op1
-
-			line := fmt.aprintf("mov %s, %s", op1, op2)
-			asmStr = strings.join([]string{asmStr, line}, "\n", context.allocator)
-
-		} else if bdata[i] >> 4 == 0b1011 { 	//no modrm second octet is just data
-			// immediate to register
-			w := (bdata[i] >> 3) & 1
-			reg := bdata[i] & 0b111
-			i += 1
-			imm: i16
-			if w == 1 {
-				imm = (^i16)(&bdata[i])^
-				i += 2
-			} else {
-				imm = i16(i8(bdata[i]))
-				i += 1
-			}
-			line := fmt.aprintf("mov %s, %d", reg_name(reg, w), imm)
+			ops := strings.join([]string{rmop, regop}, ", ", context.allocator)
+			line := strings.join([]string{mnemonic, ops}, " ", context.allocator)
+			log.info(line)
 			asmStr = strings.join([]string{asmStr, line}, "\n", context.allocator)
 		} else {
-			log.errorf("unknown opcode: %08b", bdata[i])
-			break
+
 		}
 	}
 	// results
